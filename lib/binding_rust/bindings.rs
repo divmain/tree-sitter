@@ -904,7 +904,14 @@ pub const TSWasmErrorKindParse: TSWasmErrorKind = 1;
 pub const TSWasmErrorKindCompile: TSWasmErrorKind = 2;
 pub const TSWasmErrorKindInstantiate: TSWasmErrorKind = 3;
 pub const TSWasmErrorKindAllocate: TSWasmErrorKind = 4;
+pub const TSWasmErrorKindResource: TSWasmErrorKind = 5;
 pub type TSWasmErrorKind = ::core::ffi::c_uint;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct TSWasmStoreOptions {
+    pub fuel: u64,
+    pub memory_limit_bytes: u64,
+}
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct TSWasmError {
@@ -917,6 +924,18 @@ unsafe extern "C" {
         engine: *mut TSWasmEngine,
         error: *mut TSWasmError,
     ) -> *mut TSWasmStore;
+}
+unsafe extern "C" {
+    #[doc = " EXTENSION: create a Wasm store with explicit resource policy."]
+    pub fn ts_wasm_store_new_with_options(
+        engine: *mut TSWasmEngine,
+        options: *const TSWasmStoreOptions,
+        error: *mut TSWasmError,
+    ) -> *mut TSWasmStore;
+}
+unsafe extern "C" {
+    #[doc = " EXTENSION: read the store's remaining fuel."]
+    pub fn ts_wasm_store_fuel_remaining(store: *const TSWasmStore, fuel: *mut u64) -> bool;
 }
 unsafe extern "C" {
     #[doc = " Free the memory associated with the given Wasm store."]

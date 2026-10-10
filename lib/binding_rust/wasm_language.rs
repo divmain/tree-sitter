@@ -40,7 +40,23 @@ pub enum WasmErrorKind {
     Parse,
     Compile,
     Instantiate,
+    /// EXTENSION: resource-policy installation or enforcement failure.
+    Resource,
     Other,
+}
+
+/// EXTENSION: construction options for [`WasmStore::new_with_options`].
+///
+/// `fuel` is installed on the store before any guest code runs (the engine
+/// must have fuel consumption enabled, or construction fails with
+/// [`WasmErrorKind::Resource`]). `memory_limit_bytes` is installed as the
+/// store's resource limiter before its memory is created; values above the
+/// integration's 128 MiB hard maximum or below its construction floor fail
+/// construction, never silently clamp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WasmStoreOptions {
+    pub fuel: u64,
+    pub memory_limit_bytes: u64,
 }
 
 impl WasmStore {
@@ -59,6 +75,42 @@ impl WasmStore {
                 Ok(Self(store))
             }
         }
+    }
+
+    /// EXTENSION: create a Wasm store with an explicit resource policy
+    /// installed on the integration's actual store before memory creation
+    /// and before any guest execution.
+    pub fn new_with_options(
+        engine: &wasmtime::Engine,
+        options: WasmStoreOptions,
+    ) -> Result<Self, WasmError> {
+        unsafe {
+            let mut error = MaybeUninit::<ffi::TSWasmError>::uninit();
+            let c_options = ffi::TSWasmStoreOptions {
+                fuel: options.fuel,
+                memory_limit_bytes: options.memory_limit_bytes,
+            };
+            let store = ffi::ts_wasm_store_new_with_options(
+                std::ptr::from_ref::<wasmtime::Engine>(engine)
+                    .cast_mut()
+                    .cast(),
+                &c_options,
+                error.as_mut_ptr(),
+            );
+            if store.is_null() {
+                Err(WasmError::new(error.assume_init()))
+            } else {
+                Ok(Self(store))
+            }
+        }
+    }
+
+    /// EXTENSION: the store's remaining fuel, `None` when the engine
+    /// has no fuel consumption enabled.
+    #[must_use]
+    pub fn fuel_remaining(&self) -> Option<u64> {
+        let mut fuel = 0_u64;
+        unsafe { ffi::ts_wasm_store_fuel_remaining(self.0, &mut fuel).then_some(fuel) }
     }
 
     pub fn load_language(&mut self, name: &str, bytes: &[u8]) -> Result<Language, WasmError> {
@@ -98,6 +150,7 @@ impl WasmError {
                 ffi::TSWasmErrorKindParse => WasmErrorKind::Parse,
                 ffi::TSWasmErrorKindCompile => WasmErrorKind::Compile,
                 ffi::TSWasmErrorKindInstantiate => WasmErrorKind::Instantiate,
+                ffi::TSWasmErrorKindResource => WasmErrorKind::Resource,
                 _ => WasmErrorKind::Other,
             },
             message,
@@ -141,6 +194,7 @@ impl fmt::Display for WasmError {
             WasmErrorKind::Parse => "Failed to parse Wasm",
             WasmErrorKind::Compile => "Failed to compile Wasm",
             WasmErrorKind::Instantiate => "Failed to instantiate Wasm module",
+            WasmErrorKind::Resource => "Failed to install the Wasm resource policy",
             WasmErrorKind::Other => "Unknown error",
         };
         write!(f, "{kind}: {}", self.message)

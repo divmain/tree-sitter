@@ -1433,6 +1433,10 @@ typedef enum {
   TSWasmErrorKindCompile,
   TSWasmErrorKindInstantiate,
   TSWasmErrorKindAllocate,
+  // EXTENSION: resource-policy installation or enforcement failure
+  // (fuel could not be installed, memory ceiling above the integration
+  // maximum or below the construction floor).
+  TSWasmErrorKindResource,
 } TSWasmErrorKind;
 
 typedef struct {
@@ -1447,6 +1451,40 @@ TSWasmStore *ts_wasm_store_new(
   TSWasmEngine *engine,
   TSWasmError *error
 );
+
+/**
+ * EXTENSION: construction options exposing resource-policy
+ * installation on the store the integration actually constructs.
+ *
+ * `fuel` is installed with `wasmtime_context_set_fuel` before any guest
+ * code runs; the engine must have fuel consumption enabled, or
+ * construction fails with `TSWasmErrorKindResource`.
+ *
+ * `memory_limit_bytes` is installed as the store's resource limiter
+ * before the store's memory is created, and the created memory's
+ * declared maximum is clamped to agree. A value above the integration's
+ * hard maximum (128 MiB) or below the construction floor fails with
+ * `TSWasmErrorKindResource`; no value is silently clamped.
+ */
+typedef struct {
+  uint64_t fuel;
+  uint64_t memory_limit_bytes;
+} TSWasmStoreOptions;
+
+/**
+ * EXTENSION: create a Wasm store with explicit resource policy.
+ */
+TSWasmStore *ts_wasm_store_new_with_options(
+  TSWasmEngine *engine,
+  const TSWasmStoreOptions *options,
+  TSWasmError *error
+);
+
+/**
+ * EXTENSION: read the store's remaining fuel. Returns false when
+ * the engine has no fuel consumption enabled (or the read fails).
+ */
+bool ts_wasm_store_fuel_remaining(const TSWasmStore *, uint64_t *fuel);
 
 /**
  * Free the memory associated with the given Wasm store.
