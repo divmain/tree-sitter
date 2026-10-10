@@ -696,7 +696,10 @@ static bool ts_wasm_store__call_module_initializer(
   }
 }
 
-TSWasmStore *ts_wasm_store_new(TSWasmEngine *engine, TSWasmError *wasm_error) {
+// FIAT EXTENSION: the constructor gains an options parameter. NULL
+// options reproduce upstream behavior exactly (no limiter, no fuel
+// installation), so `ts_wasm_store_new` below is behavior-identical.
+static TSWasmStore *ts_wasm_store__new(TSWasmEngine *engine, const TSWasmStoreOptions *options, TSWasmError *wasm_error) {
   TSWasmStore *self = ts_calloc(1, sizeof(TSWasmStore));
   wasmtime_store_t *store = wasmtime_store_new(engine, self, NULL);
   wasmtime_context_t *context = wasmtime_store_context(store);
@@ -710,6 +713,36 @@ TSWasmStore *ts_wasm_store_new(TSWasmEngine *engine, TSWasmError *wasm_error) {
   wasm_memorytype_t *memory_type = NULL;
   wasm_tabletype_t *table_type = NULL;
   wasmtime_func_t *lexer_funcs = NULL;
+
+  // FIAT EXTENSION: install the resource policy on THIS store before its
+  // memory is created (the limiter constrains only future
+  // creation/growth) and before any guest code runs (fuel).
+  uint64_t memory_limit_bytes = (uint64_t)MAX_MEMORY_SIZE * MEMORY_PAGE_SIZE;
+  if (options) {
+    if (options->memory_limit_bytes > memory_limit_bytes) {
+      wasm_error->kind = TSWasmErrorKindResource;
+      format(
+        &wasm_error->message,
+        "requested memory limit %llu bytes exceeds the integration maximum %llu bytes",
+        (unsigned long long)options->memory_limit_bytes,
+        (unsigned long long)memory_limit_bytes
+      );
+      goto error;
+    }
+    memory_limit_bytes = options->memory_limit_bytes;
+    wasmtime_store_limiter(store, (int64_t)memory_limit_bytes, -1, -1, -1, -1);
+    error = wasmtime_context_set_fuel(context, options->fuel);
+    if (error) {
+      wasmtime_error_message(error, &message);
+      wasm_error->kind = TSWasmErrorKindResource;
+      format(
+        &wasm_error->message,
+        "failed to install fuel on the Wasm store (engine fuel consumption enabled?): %.*s",
+        (int)message.size, message.data
+      );
+      goto error;
+    }
+  }
 
   // Define functions called by scanners via function pointers on the lexer.
   LexerInWasmMemory lexer = {
@@ -842,7 +875,24 @@ TSWasmStore *ts_wasm_store_new(TSWasmEngine *engine, TSWasmError *wasm_error) {
 
   // Initialize store's memory
   uint64_t initial_memory_pages = wasmtime_memorytype_minimum(stdlib_memory_type);
-  wasm_limits_t memory_limits = {.min = initial_memory_pages, .max = MAX_MEMORY_SIZE};
+  // FIAT EXTENSION: the declared maximum agrees with the installed
+  // limiter — a larger request never silently bypasses it. A limit below
+  // the stdlib's declared initial memory is refused HERE: the wasmtime
+  // C API's memory-type constructor panics (unwrap) on max < min, an
+  // FFI-unwind abort, so the invalid shape never reaches wasmtime.
+  uint64_t limit_pages = memory_limit_bytes / MEMORY_PAGE_SIZE;
+  if (limit_pages < initial_memory_pages) {
+    wasm_error->kind = TSWasmErrorKindResource;
+    format(
+      &wasm_error->message,
+      "memory limit %llu bytes is below the Wasm stdlib's initial memory %llu bytes",
+      (unsigned long long)memory_limit_bytes,
+      (unsigned long long)(initial_memory_pages * MEMORY_PAGE_SIZE)
+    );
+    goto error;
+  }
+  uint32_t max_pages = limit_pages < MAX_MEMORY_SIZE ? (uint32_t)limit_pages : MAX_MEMORY_SIZE;
+  wasm_limits_t memory_limits = {.min = initial_memory_pages, .max = max_pages};
   memory_type = wasm_memorytype_new(&memory_limits);
   wasmtime_memory_t memory;
   error = wasmtime_memory_new(context, memory_type, &memory);
@@ -946,6 +996,11 @@ TSWasmStore *ts_wasm_store_new(TSWasmEngine *engine, TSWasmError *wasm_error) {
     goto error;
   }
   wasm_importtype_vec_delete(&import_types);
+  // FIAT EXTENSION: the error label re-deletes `import_types` when its
+  // size is nonzero; upstream leaves the deleted vec's size set, a latent
+  // double-free any later construction failure would trip (the same shape
+  // as `stdlib_module` below).
+  import_types = (wasm_importtype_vec_t)WASM_EMPTY_VEC;
 
   // Process the stdlib module's exports.
   for (unsigned i = 0; i < stdlib_symbols_len; i++) {
@@ -1019,7 +1074,14 @@ TSWasmStore *ts_wasm_store_new(TSWasmEngine *engine, TSWasmError *wasm_error) {
   }
 
   wasm_exporttype_vec_delete(&export_types);
+  // FIAT EXTENSION: same latent double-free shape as `stdlib_module`.
+  export_types = (wasm_exporttype_vec_t)WASM_EMPTY_VEC;
   wasmtime_module_delete(stdlib_module);
+  // FIAT EXTENSION: the error label deletes `stdlib_module` again if it
+  // is non-NULL; upstream never NULLs it here, a latent double-free any
+  // later construction failure (the table grow or a limiter-denied lexer
+  // grow) would trip.
+  stdlib_module = NULL;
 
   // Add all of the lexer callback functions to the function table. Store their function table
   // indices on the in-memory lexer.
@@ -1044,6 +1106,9 @@ TSWasmStore *ts_wasm_store_new(TSWasmEngine *engine, TSWasmError *wasm_error) {
     table_index++;
   }
   ts_free(lexer_funcs);
+  // FIAT EXTENSION: the error label frees `lexer_funcs` unconditionally;
+  // NULL it here so a later construction failure does not double-free.
+  lexer_funcs = NULL;
 
   self->current_function_table_offset = table_index;
   self->lexer_address = initial_memory_pages * MEMORY_PAGE_SIZE;
@@ -1052,7 +1117,21 @@ TSWasmStore *ts_wasm_store_new(TSWasmEngine *engine, TSWasmError *wasm_error) {
   // Grow the memory enough to hold the builtin lexer and serialization buffer.
   uint32_t new_pages_needed = (self->current_memory_offset - self->lexer_address - 1) / MEMORY_PAGE_SIZE + 1;
   uint64_t prev_memory_size;
-  wasmtime_memory_grow(context, &memory, new_pages_needed, &prev_memory_size);
+  // FIAT EXTENSION: upstream ignores this result; with a limiter
+  // installed a denied grow would leave the lexer memcpy below writing
+  // past the memory's data. Fail construction instead.
+  error = wasmtime_memory_grow(context, &memory, new_pages_needed, &prev_memory_size);
+  if (error) {
+    wasmtime_error_message(error, &message);
+    wasm_error->kind = TSWasmErrorKindResource;
+    format(
+      &wasm_error->message,
+      "memory limit %llu bytes is below the integration's construction floor: %.*s",
+      (unsigned long long)memory_limit_bytes,
+      (int)message.size, message.data
+    );
+    goto error;
+  }
 
   uint8_t *memory_data = wasmtime_memory_data(context, &memory);
   memcpy(&memory_data[self->lexer_address], &lexer, sizeof(lexer));
@@ -1069,9 +1148,33 @@ error:
   if (error) wasmtime_error_delete(error);
   if (message.size) wasm_byte_vec_delete(&message);
   if (export_types.size) wasm_exporttype_vec_delete(&export_types);
-  if (imports) ts_free(imports);
+  if (imports)   ts_free(imports);
   ts_free(lexer_funcs);
   return NULL;
+}
+
+TSWasmStore *ts_wasm_store_new(TSWasmEngine *engine, TSWasmError *wasm_error) {
+  return ts_wasm_store__new(engine, NULL, wasm_error);
+}
+
+// FIAT EXTENSION: the option-carrying constructor.
+TSWasmStore *ts_wasm_store_new_with_options(TSWasmEngine *engine, const TSWasmStoreOptions *options, TSWasmError *wasm_error) {
+  return ts_wasm_store__new(engine, options, wasm_error);
+}
+
+// FIAT EXTENSION: remaining-fuel read for attempt classification and
+// the fuel-per-byte measurement interface.
+bool ts_wasm_store_fuel_remaining(const TSWasmStore *self, uint64_t *fuel) {
+  if (!self || !fuel) return false;
+  wasmtime_error_t *error = wasmtime_context_get_fuel(
+    wasmtime_store_context(self->store),
+    fuel
+  );
+  if (error) {
+    wasmtime_error_delete(error);
+    return false;
+  }
+  return true;
 }
 
 void ts_wasm_store_delete(TSWasmStore *self) {
@@ -1804,6 +1907,19 @@ void ts_wasm_store_reset_heap(TSWasmStore *self) {
   wasmtime_val_t args[1] = {
     {.of.i32 = ts_wasm_store__heap_address(self), .kind = WASMTIME_I32},
   };
+
+  // FIAT EXTENSION: a heap reset cannot run with exhausted fuel, and the
+  // upstream `ts_assert(!trap)` below aborts debug builds when it is
+  // attempted. With fuel enabled and none remaining, skip the unbudgeted
+  // guest call; the fresh-store-per-attempt lifecycle discards the store
+  // anyway, and a trapped teardown must never assert.
+  uint64_t remaining_fuel = 0;
+  wasmtime_error_t *fuel_error = wasmtime_context_get_fuel(context, &remaining_fuel);
+  if (fuel_error) {
+    wasmtime_error_delete(fuel_error);
+  } else if (remaining_fuel == 0) {
+    return;
+  }
 
   wasmtime_error_t *error = wasmtime_func_call(context, func, args, 1, NULL, 0, &trap);
   ts_assert(!error);
