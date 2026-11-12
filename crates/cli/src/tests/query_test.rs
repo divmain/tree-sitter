@@ -6812,6 +6812,46 @@ fn test_query_captures_past_the_16_bit_tree_depth() {
     assert_eq!(innermost_open_brace_capture, Some("punctuation.bracket"));
 }
 
+// A finished state can stay in progress while the cursor descends: the
+// match for `(function_item)*` below is deferred until the cursor leaves
+// the root, in case a longer match follows. A state at its DONE step must
+// never be matched against a node, however far below its start the cursor
+// goes (upstream asserts, or reads past the pattern's steps, at depth 65535).
+#[test]
+fn test_query_finished_state_past_the_16_bit_tree_depth() {
+    let language = get_language("rust");
+    let mut parser = Parser::new();
+    parser.set_language(&language).unwrap();
+    let query = Query::new(&language, "(source_file (function_item)* @function)").unwrap();
+
+    // The shallow leg pins the expectation inside the 16-bit depth range.
+    for levels in [1, 40_000] {
+        let source = format!("fn f(){}{}", "{".repeat(levels), "}".repeat(levels));
+        let tree = parser.parse(&source, None).unwrap();
+        assert_eq!(
+            max_tree_depth(&tree) > usize::from(u16::MAX),
+            levels == 40_000
+        );
+
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+        let mut found = Vec::new();
+        while let Some(m) = matches.next() {
+            found.push(
+                m.captures()
+                    .iter()
+                    .map(|c| (c.node.kind(), c.node.byte_range()))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(
+            found,
+            [[("function_item", 0..source.len())]],
+            "{levels} levels"
+        );
+    }
+}
+
 /// The depth of the tree's deepest node (the root is depth 0), walked
 /// iteratively so the measurement cannot overflow the stack.
 fn max_tree_depth(tree: &Tree) -> usize {

@@ -3792,7 +3792,25 @@ static void ts_query_cursor__add_state(
   const PatternEntry *pattern
 ) {
   QueryStep *step = array_get(&self->query->steps, pattern->step_index);
-  uint32_t start_depth = self->depth - step->depth;
+  // tuinkle: SEC-QUERY-DEPTH - a pattern-map entry can start at a step the
+  // subtraction below underflows on: the DONE step of a pattern whose root
+  // is optional (`(x)*`, `(x)?`), or a wildcard-root pattern's depth-1 step
+  // at the traversal root. Upstream's `uint16_t` field turned those into
+  // start depths that never satisfy `start_depth + step->depth == depth` in
+  // a tree shallower than 65535; a `uint32_t` field would make the sum wrap
+  // back to `depth` exactly, and the cursor would then match the DONE step
+  // and advance past the end of the pattern. Keep upstream's values: one
+  // level below the current node for the DONE step (at every depth), and
+  // the 16-bit wrapped value for the root-level underflow.
+  uint32_t start_depth;
+  if (step->depth == PATTERN_DONE_MARKER) {
+    start_depth = self->depth + 1;
+  } else if (step->depth > self->depth) {
+    start_depth = (self->depth - step->depth) & UINT16_MAX;
+  } else {
+    start_depth = self->depth - step->depth;
+  }
+  // tuinkle: end SEC-QUERY-DEPTH
 
   // Keep the states array in ascending order of start_depth and pattern_index,
   // so that it can be processed more efficiently elsewhere. Usually, there is
@@ -4266,6 +4284,15 @@ static inline bool ts_query_cursor__advance(
           QueryStep *step = array_get(&self->query->steps, state->step_index);
           state->has_in_progress_alternatives = false;
           copy_count = 0;
+
+          // tuinkle: SEC-QUERY-DEPTH - a state at its DONE step (a finished
+          // match deferred in case a longer one follows) has nothing left to
+          // match. Its `start_depth + step->depth` is at least 65535, so the
+          // depth check below skips it only while the cursor is within 65535
+          // levels of the state's start; deeper, the sum can equal `depth`
+          // and the state would advance past the end of its pattern.
+          if (step->depth == PATTERN_DONE_MARKER) continue;
+          // tuinkle: end SEC-QUERY-DEPTH
 
           // Check that the node matches all of the criteria for the next
           // step of the pattern.

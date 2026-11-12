@@ -1,9 +1,9 @@
 # tuinkle fork of tree-sitter
 
 This branch is upstream tree-sitter `v0.27.2` plus the narrow patches
-below. Each patch is its own commit (or commit pair, with its tests), and
-every hunk is fenced in the source so it can be re-ported or dropped on its
-own:
+below. Each patch is carried in its own commits (the patch, its fixes, and
+its tests), and every hunk is fenced in the source so it can be re-ported
+or dropped on its own:
 
 - the Wasm store resource-policy extension is marked `EXTENSION:`;
 - the other patches are fenced `tuinkle: <NAME>` / `tuinkle: end <NAME>`.
@@ -150,16 +150,49 @@ same bytes two levels per brace and hits the cliff on its own. No
 request-side bound can reach this: the injection callback sees only a
 language name, and the highlighter owns its query cursor.
 
-The fix is one field-width change. `QueryState` grows from 16 to 20 bytes;
-the layout is internal to `query.c`, and the public API and ABI are
-unchanged.
+The patch has three fenced hunks:
 
-The regression test parses 40 000 nested Rust blocks with the `rust`
-fixture grammar (tree depth ~80 000, which the test asserts exceeds 65535)
-and runs a raw `QueryCursor` over the fixture's `highlights.scm`. It
-asserts the full capture count (`2 * 40 000 + 4`) and that the innermost
-brace is captured. It uses no wall time: on `uint16_t` it fails by count
-(65 538 captures instead of 80 004).
+1. The field width. On this base `QueryState` stays 24 bytes (the wider
+   field fills existing padding; measured with clang on arm64). The layout
+   is internal to `query.c`, and the public API and ABI are unchanged.
+2. `ts_query_cursor__add_state` computes the start depth explicitly where
+   `self->depth - step->depth` underflows. A pattern whose root is
+   optional (`(x)*`, `(x)?`) has a pattern-map entry at its DONE step,
+   whose depth is the `UINT16_MAX` marker; a wildcard-root pattern starts
+   at a depth-1 step, which underflows at the traversal root. Upstream's
+   16-bit field turned these into start depths that never satisfy
+   `start_depth + step->depth == depth`. With the field widened alone, the
+   sum wraps back to `depth` exactly, so the cursor matched the DONE step
+   and stepped past the end of the pattern at every depth: upstream's
+   `test_consecutive_zero_or_modifiers` hit a `ts_assert` (and release
+   builds read past the query's steps). The hunk stores upstream's values:
+   `depth + 1` for the DONE step, and the 16-bit wrapped value for the
+   root-level underflow. Results inside the 16-bit range are identical to
+   upstream's.
+3. The cursor's node-matching loop skips states at their DONE step
+   explicitly. A finished match deferred in case a longer one follows
+   (for example `(source_file (function_item)* @f)`, deferred until the
+   cursor leaves the root) stays in progress while the cursor descends.
+   Its `start_depth + 65535` equals the cursor depth 65535 levels below its
+   start, and the cursor then advances it past the end of its pattern.
+   This one is an upstream bug, independent of the field width: v0.27.2
+   asserts (debug) or reads out of bounds (release) on such a query over a
+   tree deeper than 65535.
+
+Tests (`crates/cli/src/tests/query_test.rs`, fenced; count/set assertions
+only, no wall time):
+
+- `test_query_captures_past_the_16_bit_tree_depth` parses 40 000 nested
+  Rust blocks with the `rust` fixture grammar (tree depth ~80 000, which
+  the test asserts exceeds 65535) and runs a raw `QueryCursor` over the
+  fixture's `highlights.scm`. It asserts the full capture count
+  (`2 * 40 000 + 4`) and that the innermost brace is captured. With a
+  `uint16_t` field it fails by count (65 538 captures instead of 80 004).
+- `test_query_finished_state_past_the_16_bit_tree_depth` runs
+  `(source_file (function_item)* @function)` over the same deep tree and
+  asserts the single match. Without hunk 3 (and on upstream v0.27.2) it
+  aborts on the `ts_assert`.
+- Hunk 2 is covered by upstream's own `test_consecutive_zero_or_modifiers`.
 
 ### Measurements
 
@@ -182,11 +215,15 @@ median of 3, release, Linux `x86_64`, AMD Ryzen AI MAX+ 395, rustc 1.98.1.
 | `macro_blocks_40000` |  78 KiB |            80 014 |    2.92 s |          80 015 | 82.4 ms |
 
 On 0.25.10, with the patch every deep shape was linear (about 0.5–0.6 ms
-per KiB) and complete; shapes inside the 16-bit range were unchanged.
+per KiB) and complete; shapes inside the 16-bit range were unchanged. The
+0.25.10 patch was the field width alone (hunk 1); hunks 2 and 3 were added
+on this base.
 
-Exit condition: drop the patch once an upstream release widens
-`QueryState::start_depth` (or otherwise stops truncating the start depth).
-Keep the regression test; it must stay green on upstream's code.
+Exit condition: drop hunks 1 and 2 together once an upstream release widens
+`QueryState::start_depth` (or otherwise stops truncating the start depth)
+without regressing optional-root patterns. Drop hunk 3 once upstream stops
+matching DONE-step states against nodes. Keep the regression tests; they
+must stay green on upstream's code.
 
 ## Base and maintenance
 
