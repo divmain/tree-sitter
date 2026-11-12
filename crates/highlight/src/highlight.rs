@@ -12,6 +12,9 @@ use std::{
         LazyLock,
         atomic::{AtomicUsize, Ordering},
     },
+    // tuinkle: HL-PARSE-BUDGET
+    time::{Duration, Instant},
+    // tuinkle: end HL-PARSE-BUDGET
 };
 
 pub use c_lib as c;
@@ -172,6 +175,9 @@ where
     highlighter: &'a mut Highlighter,
     injection_callback: F,
     cancellation_flag: Option<&'a AtomicUsize>,
+    // tuinkle: HL-PARSE-BUDGET
+    parse_budget: Option<Duration>,
+    // tuinkle: end HL-PARSE-BUDGET
     layers: Vec<HighlightIterLayer<'a>>,
     iter_count: usize,
     next_event: Option<HighlightEvent>,
@@ -297,6 +303,37 @@ impl Highlighter {
         source: &'a [u8],
         encoding: Option<u32>,
         cancellation_flag: Option<&'a AtomicUsize>,
+        injection_callback: impl FnMut(&str) -> Option<&'a HighlightConfiguration> + 'a,
+    ) -> Result<impl Iterator<Item = Result<HighlightEvent, Error>> + 'a, Error> {
+        self.highlight_with_parse_budget(
+            config,
+            source,
+            encoding,
+            cancellation_flag,
+            None,
+            injection_callback,
+        )
+    }
+
+    // tuinkle: HL-PARSE-BUDGET
+    /// Like [`highlight`](Self::highlight), with a per-parse time budget.
+    ///
+    /// Every parse the highlighter drives — the root layer's, each combined
+    /// injection's, and each lazily constructed injected layer's — gets its
+    /// own deadline of `parse_budget` measured from the start of that parse.
+    /// A parse whose deadline passes halts and surfaces as
+    /// [`Error::Cancelled`], the same error a set cancellation flag produces;
+    /// a caller that needs to tell the two apart reads its own flag. The
+    /// budget is a per-call argument, so the highlighter's parser keeps no
+    /// budget state between calls. `None` behaves exactly like
+    /// [`highlight`](Self::highlight).
+    pub fn highlight_with_parse_budget<'a>(
+        &'a mut self,
+        config: &'a HighlightConfiguration,
+        source: &'a [u8],
+        encoding: Option<u32>,
+        cancellation_flag: Option<&'a AtomicUsize>,
+        parse_budget: Option<Duration>,
         mut injection_callback: impl FnMut(&str) -> Option<&'a HighlightConfiguration> + 'a,
     ) -> Result<impl Iterator<Item = Result<HighlightEvent, Error>> + 'a, Error> {
         let layers = HighlightIterLayer::new(
@@ -305,6 +342,7 @@ impl Highlighter {
             None,
             self,
             cancellation_flag,
+            parse_budget,
             &mut injection_callback,
             config,
             0,
@@ -323,6 +361,7 @@ impl Highlighter {
             byte_offset: 0,
             injection_callback,
             cancellation_flag,
+            parse_budget,
             highlighter: self,
             iter_count: 0,
             layers,
@@ -332,6 +371,7 @@ impl Highlighter {
         result.sort_layers();
         Ok(result)
     }
+    // tuinkle: end HL-PARSE-BUDGET
 }
 
 impl HighlightConfiguration {
@@ -531,6 +571,9 @@ impl<'a> HighlightIterLayer<'a> {
         parent_name: Option<&str>,
         highlighter: &mut Highlighter,
         cancellation_flag: Option<&'a AtomicUsize>,
+        // tuinkle: HL-PARSE-BUDGET
+        parse_budget: Option<Duration>,
+        // tuinkle: end HL-PARSE-BUDGET
         injection_callback: &mut F,
         mut config: &'a HighlightConfiguration,
         mut depth: usize,
@@ -542,16 +585,21 @@ impl<'a> HighlightIterLayer<'a> {
             if highlighter.parser.set_included_ranges(&ranges).is_ok() {
                 highlighter.parser.set_language(&config.language)?;
 
+                // tuinkle: HL-PARSE-BUDGET
+                let deadline = parse_budget.and_then(|budget| Instant::now().checked_add(budget));
+                // tuinkle: end HL-PARSE-BUDGET
                 let progress_callack = &mut |_: &ParseState| {
-                    if let Some(cancellation_flag) = cancellation_flag {
-                        if cancellation_flag.load(Ordering::SeqCst) != 0 {
-                            ControlFlow::Break(())
-                        } else {
-                            ControlFlow::Continue(())
-                        }
-                    } else {
-                        ControlFlow::Continue(())
+                    if let Some(cancellation_flag) = cancellation_flag
+                        && cancellation_flag.load(Ordering::SeqCst) != 0
+                    {
+                        return ControlFlow::Break(());
                     }
+                    // tuinkle: HL-PARSE-BUDGET
+                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        return ControlFlow::Break(());
+                    }
+                    // tuinkle: end HL-PARSE-BUDGET
+                    ControlFlow::Continue(())
                 };
                 let parse_opts = ParseOptions::new().progress_callback(progress_callack);
 
@@ -983,6 +1031,9 @@ where
                             Some(self.language_name),
                             self.highlighter,
                             self.cancellation_flag,
+                            // tuinkle: HL-PARSE-BUDGET
+                            self.parse_budget,
+                            // tuinkle: end HL-PARSE-BUDGET
                             &mut self.injection_callback,
                             config,
                             self.layers[0].depth + 1,
