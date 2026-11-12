@@ -137,4 +137,19 @@ tree-sitter-highlight = { path = "./crates/highlight", version = "0.27.2" }
 tree-sitter-loader = { path = "./crates/loader", version = "0.27.2" }
 tree-sitter-tags = { path = "./crates/tags", version = "0.27.2" }
 
-tree-sitter-language = { path = "./crates/language", version = "0.1.9" }
+# tuinkle: REGISTRY-LANGUAGE
+# `tree-sitter` takes `tree-sitter-language` from crates.io, not by path, so
+# a git dependent of this fork resolves the same package every grammar crate
+# resolves (both declare `links = "tree-sitter-language"`, so a path copy
+# beside the registry release cannot share one dependency graph). The
+# crates.io 0.1.9 release is byte-identical to `crates/language`. Inside this
+# workspace the `[patch.crates-io]` entry below keeps building the member.
+tree-sitter-language = { version = "0.1.9" }
+# tuinkle: end REGISTRY-LANGUAGE
+
+# tuinkle: REGISTRY-LANGUAGE
+# Applies only when this workspace is the build root; git dependents resolve
+# the crates.io release (see the `tree-sitter-language` workspace dependency).
+[patch.crates-io]
+tree-sitter-language = { path = "./crates/language" }
+# tuinkle: end REGISTRY-LANGUAGE
