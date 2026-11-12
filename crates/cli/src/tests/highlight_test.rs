@@ -1,14 +1,17 @@
 use std::{
     ffi::CString,
     fs,
+    ops::ControlFlow,
     os::raw::c_char,
     ptr, slice,
     sync::{
         LazyLock,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
+use tree_sitter::{ParseOptions, ParseState, Parser};
 use tree_sitter_highlight::{
     Error, Highlight, HighlightConfiguration, HighlightEvent, Highlighter, HtmlRenderer, c,
 };
@@ -506,6 +509,202 @@ fn test_highlighting_cancellation() {
         "Expected a cancellation error while iterating events"
     );
 }
+
+// tuinkle: HL-PARSE-BUDGET
+// A zero budget's deadline has passed by the parse's first progress check,
+// so these tests stay deterministic: they assert where the progress callback
+// does or does not fire instead of depending on parse speed.
+
+fn large_javascript_source() -> String {
+    "function a() { console.log('hi'); }\n".repeat(500)
+}
+
+fn progress_check_count(language_name: &str, source: &str) -> usize {
+    let mut parser = Parser::new();
+    parser.set_language(&get_language(language_name)).unwrap();
+    let mut checks = 0;
+    let mut progress_callback = |_: &ParseState| {
+        checks += 1;
+        ControlFlow::Continue(())
+    };
+    parser
+        .parse_with_options(
+            &mut |i, _| source.as_bytes().get(i..).unwrap_or_default(),
+            None,
+            Some(ParseOptions::new().progress_callback(&mut progress_callback)),
+        )
+        .unwrap();
+    checks
+}
+
+fn collect_events(
+    events: impl Iterator<Item = Result<HighlightEvent, Error>>,
+) -> Result<Vec<String>, Error> {
+    events
+        .map(|event| event.map(|event| format!("{event:?}")))
+        .collect()
+}
+
+fn highlight_events(
+    highlighter: &mut Highlighter,
+    config: &HighlightConfiguration,
+    source: &str,
+) -> Vec<String> {
+    collect_events(
+        highlighter
+            .highlight(
+                config,
+                source.as_bytes(),
+                None,
+                None,
+                &test_language_for_injection_string,
+            )
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+fn budgeted_events(
+    highlighter: &mut Highlighter,
+    config: &HighlightConfiguration,
+    source: &str,
+    parse_budget: Option<Duration>,
+) -> Result<Vec<String>, Error> {
+    collect_events(highlighter.highlight_with_parse_budget(
+        config,
+        source.as_bytes(),
+        None,
+        None,
+        parse_budget,
+        &test_language_for_injection_string,
+    )?)
+}
+
+#[test]
+fn test_highlighting_with_parse_budget_matches_highlight_when_not_exceeded() {
+    let html = format!(
+        "<body>\n<script>\n{}</script>\n</body>\n",
+        large_javascript_source()
+    );
+    let ejs = "<% if (a) { %><div><%= b %></div><% } %>";
+    let javascript = "const s = html `<div>${a < b}</div>`;";
+    for (name, config, source) in [
+        ("html", &*HTML_HIGHLIGHT, html.as_str()),
+        ("ejs", &*EJS_HIGHLIGHT, ejs),
+        ("javascript", &*JS_HIGHLIGHT, javascript),
+    ] {
+        let expected = highlight_events(&mut Highlighter::new(), config, source);
+        assert!(!expected.is_empty());
+        for parse_budget in [None, Some(Duration::from_secs(60))] {
+            assert_eq!(
+                budgeted_events(&mut Highlighter::new(), config, source, parse_budget).unwrap(),
+                expected,
+                "{name} with {parse_budget:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_highlighting_with_zero_parse_budget_halts_the_root_parse() {
+    let source = large_javascript_source();
+    assert!(
+        progress_check_count("javascript", &source) > 0,
+        "the parse must reach a progress check"
+    );
+
+    let mut highlighter = Highlighter::new();
+    let result = highlighter.highlight_with_parse_budget(
+        &JS_HIGHLIGHT,
+        source.as_bytes(),
+        None,
+        None,
+        Some(Duration::ZERO),
+        &test_language_for_injection_string,
+    );
+    assert!(matches!(result, Err(Error::Cancelled)));
+    drop(result);
+
+    // The halted highlighter keeps no budget state: an unbudgeted call on it
+    // completes with the same events as a fresh highlighter.
+    let expected = highlight_events(&mut Highlighter::new(), &JS_HIGHLIGHT, &source);
+    assert_eq!(
+        highlight_events(&mut highlighter, &JS_HIGHLIGHT, &source),
+        expected
+    );
+}
+
+#[test]
+fn test_highlighting_with_zero_parse_budget_halts_an_injected_parse() {
+    // The HTML layer's parse is too short to reach a progress check, so only
+    // the injected JavaScript layer's parse can exhaust the budget.
+    let script = large_javascript_source();
+    let source = format!("<script>\n{script}</script>\n");
+    assert_eq!(progress_check_count("html", &source), 0);
+    assert!(progress_check_count("javascript", &script) > 0);
+
+    let mut highlighter = Highlighter::new();
+    let mut events = highlighter
+        .highlight_with_parse_budget(
+            &HTML_HIGHLIGHT,
+            source.as_bytes(),
+            None,
+            None,
+            Some(Duration::ZERO),
+            &test_language_for_injection_string,
+        )
+        .unwrap();
+    let mut events_before_halt = 0;
+    let error = loop {
+        match events.next() {
+            Some(Ok(_)) => events_before_halt += 1,
+            Some(Err(error)) => break Some(error),
+            None => break None,
+        }
+    };
+    drop(events);
+    assert_eq!(error, Some(Error::Cancelled));
+    assert!(
+        events_before_halt > 0,
+        "the HTML layer highlights before the injected parse"
+    );
+
+    let expected = highlight_events(&mut Highlighter::new(), &HTML_HIGHLIGHT, &source);
+    assert_eq!(
+        highlight_events(&mut highlighter, &HTML_HIGHLIGHT, &source),
+        expected
+    );
+}
+
+#[test]
+fn test_highlighting_with_zero_parse_budget_halts_a_combined_injection_parse() {
+    // The template's parse is too short to reach a progress check, so only
+    // the combined JavaScript injection's parse, which runs eagerly inside the
+    // highlight call, can exhaust the budget.
+    let code = large_javascript_source();
+    let source = format!("<% {code} %>");
+    assert_eq!(progress_check_count("embedded-template", &source), 0);
+    assert!(progress_check_count("javascript", &code) > 0);
+
+    let mut highlighter = Highlighter::new();
+    let result = highlighter.highlight_with_parse_budget(
+        &EJS_HIGHLIGHT,
+        source.as_bytes(),
+        None,
+        None,
+        Some(Duration::ZERO),
+        &test_language_for_injection_string,
+    );
+    assert!(matches!(result, Err(Error::Cancelled)));
+    drop(result);
+
+    let expected = highlight_events(&mut Highlighter::new(), &EJS_HIGHLIGHT, &source);
+    assert_eq!(
+        highlight_events(&mut highlighter, &EJS_HIGHLIGHT, &source),
+        expected
+    );
+}
+// tuinkle: end HL-PARSE-BUDGET
 
 #[test]
 fn test_highlighting_via_c_api() {
