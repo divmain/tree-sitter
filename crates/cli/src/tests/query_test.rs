@@ -1,4 +1,4 @@
-use std::{cell::Cell, env, fmt::Write, ops::ControlFlow, sync::LazyLock};
+use std::{cell::Cell, env, fmt::Write, fs, ops::ControlFlow, sync::LazyLock};
 
 use indoc::indoc;
 use rand::{SeedableRng, prelude::StdRng};
@@ -6,14 +6,14 @@ use streaming_iterator::StreamingIterator;
 use tree_sitter::{
     CaptureQuantifier, InputEdit, Language, Node, Parser, Point, Query, QueryCursor,
     QueryCursorOptions, QueryCursorState, QueryError, QueryErrorKind, QueryPredicate,
-    QueryPredicateArg, QueryProperty, Range,
+    QueryPredicateArg, QueryProperty, Range, Tree,
 };
 use tree_sitter_generate::load_grammar_file;
 use unindent::Unindent;
 
 use super::helpers::{
     allocations,
-    fixtures::{get_language, get_test_language},
+    fixtures::{get_language, get_language_queries_path, get_test_language},
     query_helpers::{Match, Pattern, assert_query_matches},
 };
 use crate::tests::{
@@ -6763,3 +6763,73 @@ fn test_last_child_anchor_looks_past_hidden_node() {
         assert_query_matches(&language, &query, source, &[(0, vec![("last", "int y;")])]);
     });
 }
+
+// tuinkle: SEC-QUERY-DEPTH
+// A query state records the tree depth where its match started. Past depth
+// 65535 that start depth must not wrap, or the cursor stops pruning those
+// states and drops every capture below that depth. Count/set assertions
+// only: a regression fails here rather than merely running slowly.
+#[test]
+fn test_query_captures_past_the_16_bit_tree_depth() {
+    // Each nested Rust block adds two tree levels
+    // (`block` -> `expression_statement` -> `block`).
+    const LEVELS: usize = 40_000;
+
+    let language = get_language("rust");
+    let mut parser = Parser::new();
+    parser.set_language(&language).unwrap();
+
+    let source = format!("fn f(){}{}", "{".repeat(LEVELS), "}".repeat(LEVELS));
+    let tree = parser.parse(&source, None).unwrap();
+    assert!(
+        max_tree_depth(&tree) > usize::from(u16::MAX),
+        "the tree must exceed the 16-bit depth range"
+    );
+
+    let highlights_query =
+        fs::read_to_string(get_language_queries_path("rust").join("highlights.scm")).unwrap();
+    let query = Query::new(&language, &highlights_query).unwrap();
+    let innermost_open_brace = "fn f()".len() + LEVELS - 1;
+
+    let mut cursor = QueryCursor::new();
+    let mut captures = cursor.captures(&query, tree.root_node(), source.as_bytes());
+    let mut count = 0;
+    let mut innermost_open_brace_capture = None;
+    while let Some((m, index)) = captures.next() {
+        count += 1;
+        let capture = m.captures()[*index];
+        if capture.node.start_byte() == innermost_open_brace {
+            innermost_open_brace_capture = Some(query.capture_names()[capture.index as usize]);
+        }
+    }
+
+    assert!(!cursor.did_exceed_match_limit());
+    assert_eq!(
+        count,
+        2 * LEVELS + 4,
+        "one capture per brace, plus `fn`, `f`, `(`, and `)`"
+    );
+    assert_eq!(innermost_open_brace_capture, Some("punctuation.bracket"));
+}
+
+/// The depth of the tree's deepest node (the root is depth 0), walked
+/// iteratively so the measurement cannot overflow the stack.
+fn max_tree_depth(tree: &Tree) -> usize {
+    let mut cursor = tree.walk();
+    let mut depth = 0;
+    let mut deepest = 0;
+    loop {
+        if cursor.goto_first_child() {
+            depth += 1;
+            deepest = deepest.max(depth);
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return deepest;
+            }
+            depth -= 1;
+        }
+    }
+}
+// tuinkle: end SEC-QUERY-DEPTH
