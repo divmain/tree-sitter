@@ -185,8 +185,9 @@ The patch has three fenced hunks:
    Its `start_depth + 65535` equals the cursor depth 65535 levels below its
    start, and the cursor then advances it past the end of its pattern.
    This one is an upstream bug, independent of the field width: v0.27.2
-   asserts (debug) or reads out of bounds (release) on such a query over a
-   tree deeper than 65535.
+   fails a `ts_assert` and aborts on such a query over a tree deeper than
+   65535 (cargo builds, release included, do not define `NDEBUG`), or reads
+   out of bounds when built with `NDEBUG`.
 
 Tests (`crates/cli/src/tests/query_test.rs`, fenced; count/set assertions
 only, no wall time):
@@ -205,28 +206,53 @@ only, no wall time):
 
 ### Measurements
 
-TODO(re-measure): the table below was measured on tree-sitter 0.25.10, not
-on this v0.27.2 base. It is pending re-measurement here; replace it (and
-this line) when that is done.
+Measured on this v0.27.2 base with the downstream tuinkle harness, from
+tuinkle's `crates/`:
 
-Measured on 0.25.10 with the downstream tuinkle harness
-(`highlight_deep_tree_cost`): one-shot `highlight_by_name` requests,
-median of 3, release, Linux `x86_64`, AMD Ryzen AI MAX+ 395, rustc 1.98.1.
-"Spans" counts the highlight spans returned.
+```sh
+cargo run --release -p tuinkle-highlight --example highlight_deep_tree_cost --features syntax
+```
 
-| Scenario             |    Size | Spans (unpatched) | Unpatched | Spans (patched) | Patched |
-| -------------------- | ------: | ----------------: | --------: | --------------: | ------: |
-| `blocks_32000`       |  64 KiB |            64 004 |   31.9 ms |          64 004 | 32.6 ms |
-| `blocks_48000`       |  94 KiB |            65 538 |    6.56 s |          96 004 | 51.8 ms |
-| `blocks_64000`       | 125 KiB |            65 538 |   15.64 s |         128 004 | 71.4 ms |
-| `parens_64000`       | 125 KiB |           128 006 |   62.1 ms |         128 006 | 63.3 ms |
-| `parens_80000`       | 156 KiB |           131 070 |    9.90 s |         160 006 | 79.8 ms |
-| `macro_blocks_40000` |  78 KiB |            80 014 |    2.92 s |          80 015 | 82.4 ms |
+One-shot `highlight_by_name` requests (tree-sitter-rust 0.24.2), median
+of 3, cargo release profile, on an Apple M3 Max (arm64, macOS 15.7.9),
+rustc 1.98.1. "Spans" counts the highlight spans returned. "v0.27.2" is
+this branch with `lib/src/query.c` restored to the `v0.27.2` tag (all
+three hunks reverted, the other patches kept); "Fork" is this branch.
 
-On 0.25.10, with the patch every deep shape was linear (about 0.5–0.6 ms
-per KiB) and complete; shapes inside the 16-bit range were unchanged. The
-0.25.10 patch was the field width alone (hunk 1); hunks 2 and 3 were added
-on this base.
+The harness bounds every parse at 5 s. Unmodified v0.27.2 runs past that
+bound on the three slow shapes, which then end in the harness's deadline
+error (after 5.03 s, 13.4 s and 5.05 s; a single iterator step can
+overrun the check). The v0.27.2 column was measured with that bound
+lifted, so it shows the full cost.
+
+| Scenario             |    Size | Spans (v0.27.2) | v0.27.2 | Spans (fork) |    Fork |
+| -------------------- | ------: | --------------: | ------: | -----------: | ------: |
+| `blocks_32000`       |  63 KiB |          64 004 | 34.3 ms |       64 004 | 32.7 ms |
+| `blocks_48000`       |  94 KiB |          65 538 |  8.86 s |       96 004 | 51.5 ms |
+| `blocks_64000`       | 125 KiB |          65 538 | 21.86 s |      128 004 | 66.2 ms |
+| `parens_64000`       | 125 KiB |         128 006 | 59.3 ms |      128 006 | 58.0 ms |
+| `parens_80000`       | 156 KiB |         131 070 | 13.14 s |      160 006 | 73.6 ms |
+| `macro_blocks_40000` |  78 KiB |          80 014 |  3.86 s |       80 015 | 77.2 ms |
+
+With the patch every deep shape is linear and complete: about 0.5 ms per
+KiB for the single-layer shapes, and about 1 ms per KiB for the macro
+shape, whose bytes are parsed and queried in two layers. The v0.27.2 span
+counts show the dropped captures. The shapes inside the 16-bit range are
+unchanged. At 48 000 blocks the longest single `HighlightIter::next` step
+(a raw `tree_sitter_highlight::Highlighter` over tree-sitter-rust's
+highlights and injections queries) is 3.19 s on v0.27.2 and 2.8 ms on the
+fork.
+
+None of these highlight shapes aborts v0.27.2. The hunk-3 shape does:
+`(source_file (function_item)* @function)` over 40 000 nested blocks
+aborts v0.27.2 in a cargo release build (cargo does not define `NDEBUG`)
+with `Assertion failed: ((uint32_t)step_index + i < self->steps.size),
+function ts_query__step_is_fallible`. The fork returns the single match.
+
+Shallow-tree query cost does not move. Interleaved A/B runs of the
+harness's `highlight_reparse_cost` give a 10 KiB Rust re-parse p95 of
+2.12 / 1.99 ms on v0.27.2 against 1.93 / 1.97 ms on the fork, and a 1 MiB
+one 192.2 / 191.4 ms against 191.3 / 192.0 ms.
 
 Exit condition: drop hunks 1 and 2 together once an upstream release widens
 `QueryState::start_depth` (or otherwise stops truncating the start depth)
