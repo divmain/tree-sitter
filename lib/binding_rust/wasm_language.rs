@@ -94,7 +94,7 @@ impl WasmStore {
                 std::ptr::from_ref::<wasmtime::Engine>(engine)
                     .cast_mut()
                     .cast(),
-                &c_options,
+                &raw const c_options,
                 error.as_mut_ptr(),
             );
             if store.is_null() {
@@ -110,7 +110,7 @@ impl WasmStore {
     #[must_use]
     pub fn fuel_remaining(&self) -> Option<u64> {
         let mut fuel = 0_u64;
-        unsafe { ffi::ts_wasm_store_fuel_remaining(self.0, &mut fuel).then_some(fuel) }
+        unsafe { ffi::ts_wasm_store_fuel_remaining(self.0, &raw mut fuel).then_some(fuel) }
     }
 
     pub fn load_language(&mut self, name: &str, bytes: &[u8]) -> Result<Language, WasmError> {
