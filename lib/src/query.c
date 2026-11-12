@@ -207,12 +207,13 @@ typedef struct {
   uint32_t id;
   uint32_t capture_list_id;
   uint32_t heap_insert_order;
-  // tuinkle: SEC-QUERY-DEPTH - see lib/README.tuinkle.md. Upstream declares
-  // this field `uint16_t`, but the cursor's `depth` is `uint32_t`, so a
-  // state started deeper than tree depth 65535 stored a wrapped depth: the
-  // leave-node pruning and `should_descend` comparisons misfired, wrapped
-  // states were never pruned, and the cursor went quadratic while dropping
-  // every capture past that depth. Widened to the cursor's depth type.
+  // tuinkle: SEC-QUERY-DEPTH - see README.tuinkle.md at the repository
+  // root. Upstream declares this field `uint16_t`, but the cursor's `depth`
+  // is `uint32_t`, so a state started deeper than tree depth 65535 stored a
+  // wrapped depth: the leave-node pruning and `should_descend` comparisons
+  // misfired, wrapped states were never pruned, and the cursor went
+  // quadratic while dropping every capture past that depth. Widened to the
+  // cursor's depth type.
   uint32_t start_depth;
   // tuinkle: end SEC-QUERY-DEPTH
   uint16_t step_index;
