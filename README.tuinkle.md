@@ -38,7 +38,13 @@ Semantics:
   lexer and serialization buffer fails construction. No value is silently
   clamped.
 - `ts_wasm_store_new` / `WasmStore::new` are unchanged: they call the same
-  constructor with no options.
+  constructor with no options. On a fuel-enabled engine they fail, because
+  a new wasmtime store holds no fuel; use `new_with_options` there.
+- Construction runs guest code (the Wasm stdlib's initializer), so it
+  spends some of the installed fuel. A budget too small for that fails with
+  `WasmErrorKind::Instantiate` (a fuel trap), not `Resource`. Fuel that
+  runs out during a parse makes the parse return `None`; the store's fuel
+  stays exhausted, so a caller starts a fresh store for the next attempt.
 - `ts_wasm_store_reset_heap` skips its guest call when fuel is enabled and
   exhausted, instead of tripping upstream's `ts_assert(!trap)`.
 - The constructor's error path no longer double-frees `import_types`,
@@ -52,6 +58,9 @@ Why: tree-sitter constructs the `wasmtime` store itself, inside
 so there is no other way to give the store a fuel budget or a memory
 ceiling. Running untrusted Wasm grammars (and their external scanners)
 needs both.
+
+Tests: none in this fork yet; the upstream `wasm_language_test` suite
+covers the unchanged `WasmStore::new` path.
 
 Exit condition: drop the patch once upstream exposes store configuration
 (fuel and a memory limiter, or the store itself) at construction time.
